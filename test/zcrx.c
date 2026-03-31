@@ -811,6 +811,370 @@ static int test_zcrx_clone(void)
 	return 0;
 }
 
+static int try_register_ifq_with_notif(struct zcrx_notification_desc *notif,
+				       void *area)
+{
+	struct io_uring_region_desc rq_region = {
+		.size = get_rq_size(RQ_ENTRIES),
+		.user_addr = uring_ptr_to_u64(def_rq_mem),
+		.flags = IORING_MEM_REGION_TYPE_USER,
+	};
+	struct io_uring_zcrx_area_reg area_reg = {
+		.addr = uring_ptr_to_u64(area),
+		.len = AREA_SZ,
+		.flags = 0,
+	};
+	struct io_uring_zcrx_ifq_reg reg = {
+		.flags = ZCRX_REG_NODEV,
+		.rq_entries = RQ_ENTRIES,
+		.area_ptr = uring_ptr_to_u64(&area_reg),
+		.region_ptr = uring_ptr_to_u64(&rq_region),
+		.notif_desc = uring_ptr_to_u64(notif),
+	};
+
+	return try_register_zcrx(&reg);
+}
+
+static int test_notif_registration(void *area)
+{
+	struct zcrx_notification_desc notif;
+	int ret;
+
+	/* Valid registration with no-buffers notification */
+	memset(&notif, 0, sizeof(notif));
+	notif.user_data = 42;
+	notif.type_mask = ZCRX_NOTIF_NO_BUFFERS;
+
+	ret = try_register_ifq_with_notif(&notif, area);
+	if (ret) {
+		fprintf(stderr, "valid notif registration failed: %d\n", ret);
+		return T_EXIT_FAIL;
+	}
+
+	/* Valid registration with both notification types */
+	memset(&notif, 0, sizeof(notif));
+	notif.user_data = 42;
+	notif.type_mask = ZCRX_NOTIF_NO_BUFFERS |
+			  ZCRX_NOTIF_COPY;
+
+	ret = try_register_ifq_with_notif(&notif, area);
+	if (ret) {
+		fprintf(stderr, "valid notif both-types registration failed: %d\n", ret);
+		return T_EXIT_FAIL;
+	}
+
+	/* Invalid type_mask (bit beyond valid range) */
+	memset(&notif, 0, sizeof(notif));
+	notif.user_data = 42;
+	notif.type_mask = (1 << 31);
+
+	ret = try_register_ifq_with_notif(&notif, area);
+	if (ret != -EINVAL) {
+		fprintf(stderr, "invalid notif type_mask should fail with -EINVAL, got %d\n", ret);
+		return T_EXIT_FAIL;
+	}
+
+	/* Non-zero reserved field should fail */
+	memset(&notif, 0, sizeof(notif));
+	notif.user_data = 42;
+	notif.type_mask = ZCRX_NOTIF_NO_BUFFERS;
+	notif.__resv2[0] = 1;
+
+	ret = try_register_ifq_with_notif(&notif, area);
+	if (ret != -EINVAL) {
+		fprintf(stderr, "non-zero resv2 should fail with -EINVAL, got %d\n", ret);
+		return T_EXIT_FAIL;
+	}
+
+	return T_EXIT_PASS;
+}
+
+static int test_notif_stats(void *area)
+{
+	struct io_uring_query_zcrx zcrx_query = {};
+	struct io_uring_query_hdr zcrx_hdr = {
+		.size = sizeof(zcrx_query),
+		.query_data = uring_ptr_to_u64(&zcrx_query),
+		.query_op = IO_URING_QUERY_ZCRX,
+	};
+	struct io_uring_query_zcrx_notif notif_query = {};
+	struct io_uring_query_hdr notif_hdr = {
+		.size = sizeof(notif_query),
+		.query_data = uring_ptr_to_u64(&notif_query),
+		.query_op = IO_URING_QUERY_ZCRX_NOTIF,
+	};
+	struct zcrx_notification_desc notif;
+	size_t ring_size, rqes_end, stats_off, hdr_size;
+	void *ring_mem;
+	int ret;
+
+	/*
+	 * Query the kernel for the actual refill ring header size and stats
+	 * struct layout so we can build a correctly-sized user region.
+	 */
+	ret = io_uring_register(-1, IORING_REGISTER_QUERY, &zcrx_hdr, 0);
+	if (ret < 0 || zcrx_hdr.result < 0) {
+		fprintf(stderr, "zcrx query not supported, skip stats test\n");
+		return T_EXIT_PASS;
+	}
+
+	ret = io_uring_register(-1, IORING_REGISTER_QUERY, &notif_hdr, 0);
+	if (ret < 0 || notif_hdr.result < 0) {
+		fprintf(stderr, "zcrx notif query not supported, skip stats test\n");
+		return T_EXIT_PASS;
+	}
+
+	if (!notif_query.notif_stats_size) {
+		fprintf(stderr, "notif stats not supported, skip stats test\n");
+		return T_EXIT_PASS;
+	}
+
+	hdr_size = T_ALIGN_UP((__u64)zcrx_query.rq_hdr_size,
+			     zcrx_query.rq_hdr_alignment);
+	rqes_end = hdr_size + sizeof(struct io_uring_zcrx_rqe) * RQ_ENTRIES;
+	stats_off = T_ALIGN_UP(rqes_end, notif_query.notif_stats_off_alignment);
+	ring_size = stats_off + notif_query.notif_stats_size;
+	ring_size = T_ALIGN_UP(ring_size, page_size);
+
+	ring_mem = mmap(NULL, ring_size, PROT_READ | PROT_WRITE,
+			MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+	if (ring_mem == MAP_FAILED) {
+		perror("mmap ring_mem");
+		return T_EXIT_FAIL;
+	}
+
+	struct io_uring_region_desc region = {
+		.user_addr = uring_ptr_to_u64(ring_mem),
+		.size = ring_size,
+		.flags = IORING_MEM_REGION_TYPE_USER,
+	};
+	struct io_uring_zcrx_area_reg area_reg = {
+		.addr = uring_ptr_to_u64(area),
+		.len = AREA_SZ,
+		.flags = 0,
+	};
+
+	/* Valid stats offset */
+	memset(&notif, 0, sizeof(notif));
+	notif.user_data = 42;
+	notif.type_mask = ZCRX_NOTIF_NO_BUFFERS;
+	notif.flags = ZCRX_NOTIF_DESC_FLAG_STATS;
+	notif.stats_offset = stats_off;
+
+	struct io_uring_zcrx_ifq_reg reg = {
+		.flags = ZCRX_REG_NODEV,
+		.rq_entries = RQ_ENTRIES,
+		.area_ptr = uring_ptr_to_u64(&area_reg),
+		.region_ptr = uring_ptr_to_u64(&region),
+		.notif_desc = uring_ptr_to_u64(&notif),
+	};
+
+	/*
+	 * Pre-fill the stats area with non-zero values to verify the kernel
+	 * zeroes it on registration.
+	 */
+	memset((char *)ring_mem + stats_off, 0xff,
+	       sizeof(struct io_uring_zcrx_notif_stats));
+
+	ret = try_register_zcrx(&reg);
+	if (ret) {
+		fprintf(stderr, "notif stats registration failed: %d\n", ret);
+		munmap(ring_mem, ring_size);
+		return T_EXIT_FAIL;
+	}
+
+	/* Verify the stats area was zeroed by the kernel */
+	struct io_uring_zcrx_notif_stats *stats =
+		(struct io_uring_zcrx_notif_stats *)((char *)ring_mem + stats_off);
+	if (stats->copy_count || stats->copy_bytes) {
+		fprintf(stderr, "stats not zeroed after registration\n");
+		munmap(ring_mem, ring_size);
+		return T_EXIT_FAIL;
+	}
+
+	/* Misaligned stats offset should fail */
+	memset(&notif, 0, sizeof(notif));
+	notif.user_data = 42;
+	notif.type_mask = ZCRX_NOTIF_NO_BUFFERS;
+	notif.flags = ZCRX_NOTIF_DESC_FLAG_STATS;
+	notif.stats_offset = stats_off + 1;
+
+	region.user_addr = uring_ptr_to_u64(ring_mem);
+	reg.region_ptr = uring_ptr_to_u64(&region);
+	reg.notif_desc = uring_ptr_to_u64(&notif);
+
+	ret = try_register_zcrx(&reg);
+	if (ret != -EINVAL) {
+		fprintf(stderr, "misaligned stats_offset should fail, got %d\n", ret);
+		munmap(ring_mem, ring_size);
+		return T_EXIT_FAIL;
+	}
+
+	/* Stats offset overlapping with rqes should fail */
+	memset(&notif, 0, sizeof(notif));
+	notif.user_data = 42;
+	notif.type_mask = ZCRX_NOTIF_NO_BUFFERS;
+	notif.flags = ZCRX_NOTIF_DESC_FLAG_STATS;
+	notif.stats_offset = sizeof(struct io_uring_zcrx_rqe);
+
+	region.user_addr = uring_ptr_to_u64(ring_mem);
+	reg.region_ptr = uring_ptr_to_u64(&region);
+	reg.notif_desc = uring_ptr_to_u64(&notif);
+
+	ret = try_register_zcrx(&reg);
+	if (ret != -EINVAL) {
+		fprintf(stderr, "overlapping stats_offset should fail, got %d\n", ret);
+		munmap(ring_mem, ring_size);
+		return T_EXIT_FAIL;
+	}
+
+	/* Stats offset beyond region should fail */
+	memset(&notif, 0, sizeof(notif));
+	notif.user_data = 42;
+	notif.type_mask = ZCRX_NOTIF_NO_BUFFERS;
+	notif.flags = ZCRX_NOTIF_DESC_FLAG_STATS;
+	notif.stats_offset = ring_size;
+
+	region.user_addr = uring_ptr_to_u64(ring_mem);
+	reg.region_ptr = uring_ptr_to_u64(&region);
+	reg.notif_desc = uring_ptr_to_u64(&notif);
+
+	ret = try_register_zcrx(&reg);
+	if (ret != -EINVAL) {
+		fprintf(stderr, "out-of-bounds stats_offset should fail, got %d\n", ret);
+		munmap(ring_mem, ring_size);
+		return T_EXIT_FAIL;
+	}
+
+	munmap(ring_mem, ring_size);
+	return T_EXIT_PASS;
+}
+
+static int test_arm_notification(void *area)
+{
+	struct zcrx_notification_desc notif;
+	struct io_uring ring;
+	struct zcrx_ctrl ctrl;
+	__u32 zcrx_id;
+	int ret;
+
+	struct io_uring_zcrx_area_reg area_reg = {
+		.addr = uring_ptr_to_u64(area),
+		.len = AREA_SZ,
+		.flags = 0,
+	};
+	struct io_uring_region_desc rq_region = {
+		.size = get_rq_size(RQ_ENTRIES),
+		.user_addr = uring_ptr_to_u64(def_rq_mem),
+		.flags = IORING_MEM_REGION_TYPE_USER,
+	};
+	struct io_uring_zcrx_ifq_reg reg = {
+		.flags = ZCRX_REG_NODEV,
+		.rq_entries = RQ_ENTRIES,
+		.area_ptr = uring_ptr_to_u64(&area_reg),
+		.region_ptr = uring_ptr_to_u64(&rq_region),
+	};
+
+	/* First, register without notifications and check arm fails */
+	ret = t_create_ring(128, &ring, RING_FLAGS);
+	if (ret != T_SETUP_OK) {
+		fprintf(stderr, "ring create failed: %d\n", ret);
+		return T_EXIT_FAIL;
+	}
+
+	ret = io_uring_register_ifq(&ring, &reg);
+	if (ret) {
+		fprintf(stderr, "ifq register failed: %d\n", ret);
+		io_uring_queue_exit(&ring);
+		return T_EXIT_FAIL;
+	}
+	zcrx_id = reg.zcrx_id;
+
+	memset(&ctrl, 0, sizeof(ctrl));
+	ctrl.zcrx_id = zcrx_id;
+	ctrl.op = ZCRX_CTRL_ARM_NOTIFICATION;
+	ctrl.zc_arm_notif.type_mask = ZCRX_NOTIF_NO_BUFFERS;
+
+	ret = io_uring_register(ring.ring_fd, IORING_REGISTER_ZCRX_CTRL,
+				&ctrl, 0);
+	if (ret != -EINVAL) {
+		fprintf(stderr, "arm without prior notif should fail, got %d\n", ret);
+		io_uring_queue_exit(&ring);
+		return T_EXIT_FAIL;
+	}
+	io_uring_queue_exit(&ring);
+
+	/* Now register with notifications and try arm with invalid mask */
+	memset(&notif, 0, sizeof(notif));
+	notif.user_data = 42;
+	notif.type_mask = ZCRX_NOTIF_NO_BUFFERS;
+
+	reg.notif_desc = uring_ptr_to_u64(&notif);
+
+	ret = t_create_ring(128, &ring, RING_FLAGS);
+	if (ret != T_SETUP_OK) {
+		fprintf(stderr, "ring create failed: %d\n", ret);
+		return T_EXIT_FAIL;
+	}
+
+	ret = io_uring_register_ifq(&ring, &reg);
+	if (ret) {
+		fprintf(stderr, "notif ifq register failed: %d\n", ret);
+		io_uring_queue_exit(&ring);
+		return T_EXIT_FAIL;
+	}
+	zcrx_id = reg.zcrx_id;
+
+	/* Arm with invalid type (bit 31) should fail */
+	memset(&ctrl, 0, sizeof(ctrl));
+	ctrl.zcrx_id = zcrx_id;
+	ctrl.op = ZCRX_CTRL_ARM_NOTIFICATION;
+	ctrl.zc_arm_notif.type_mask = (1 << 31);
+
+	ret = io_uring_register(ring.ring_fd, IORING_REGISTER_ZCRX_CTRL,
+				&ctrl, 0);
+	if (ret != -EINVAL) {
+		fprintf(stderr, "arm with invalid mask should fail, got %d\n", ret);
+		io_uring_queue_exit(&ring);
+		return T_EXIT_FAIL;
+	}
+
+	/*
+	 * Arm for a type that hasn't fired yet should fail because the kernel
+	 * only allows rearming notifications that have already been delivered.
+	 */
+	memset(&ctrl, 0, sizeof(ctrl));
+	ctrl.zcrx_id = zcrx_id;
+	ctrl.op = ZCRX_CTRL_ARM_NOTIFICATION;
+	ctrl.zc_arm_notif.type_mask = ZCRX_NOTIF_NO_BUFFERS;
+
+	ret = io_uring_register(ring.ring_fd, IORING_REGISTER_ZCRX_CTRL,
+				&ctrl, 0);
+	if (ret != -EINVAL) {
+		fprintf(stderr, "arm for unfired notif should fail, got %d\n", ret);
+		io_uring_queue_exit(&ring);
+		return T_EXIT_FAIL;
+	}
+
+	/* Non-zero reserved in arm_notif should fail */
+	memset(&ctrl, 0, sizeof(ctrl));
+	ctrl.zcrx_id = zcrx_id;
+	ctrl.op = ZCRX_CTRL_ARM_NOTIFICATION;
+	ctrl.zc_arm_notif.type_mask = ZCRX_NOTIF_NO_BUFFERS;
+	ctrl.zc_arm_notif.__resv[0] = 1;
+
+	ret = io_uring_register(ring.ring_fd, IORING_REGISTER_ZCRX_CTRL,
+				&ctrl, 0);
+	if (ret != -EINVAL) {
+		fprintf(stderr, "arm with non-zero resv should fail, got %d\n", ret);
+		io_uring_queue_exit(&ring);
+		return T_EXIT_FAIL;
+	}
+
+	io_uring_queue_exit(&ring);
+	return T_EXIT_PASS;
+}
+
 static int test_rq_flush(void)
 {
 	struct t_executor ctx;
@@ -1110,6 +1474,24 @@ static int run_tests(void)
 	if (ret) {
 		fprintf(stderr, "test_invalid_rq_pointers() failed %i\n", ret);
 		return T_EXIT_FAIL;
+	}
+
+	ret = test_notif_registration(def_area_mem);
+	if (ret) {
+		fprintf(stderr, "test_notif_registration failed\n");
+		return ret;
+	}
+
+	ret = test_notif_stats(def_area_mem);
+	if (ret) {
+		fprintf(stderr, "test_notif_stats failed\n");
+		return ret;
+	}
+
+	ret = test_arm_notification(def_area_mem);
+	if (ret) {
+		fprintf(stderr, "test_arm_notification failed\n");
+		return ret;
 	}
 
 	ret = test_recv();
