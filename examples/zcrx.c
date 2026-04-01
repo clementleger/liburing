@@ -91,7 +91,10 @@ static size_t cfg_size = 0;
 static unsigned cfg_affinity_mode = AFFINITY_MODE_NONE;
 static unsigned cfg_rq_alloc_mode = RQ_ALLOC_USER;
 static unsigned cfg_area_type = AREA_TYPE_NORMAL;
+static bool cfg_notif;
 static struct sockaddr_in6 cfg_addr;
+
+#define NOTIF_USER_DATA		UINT64_MAX
 
 static long page_size;
 
@@ -102,6 +105,8 @@ static struct io_uring_zcrx_rq rq_ring;
 static unsigned long area_token;
 static bool stop;
 static __u32 zcrx_id;
+static unsigned notif_stats_offset;
+static struct io_uring_zcrx_notif_stats *notif_stats;
 
 static int dmabuf_fd;
 static int memfd;
@@ -159,11 +164,20 @@ static struct zc_conn *get_connection(__u64 user_data)
 	return (struct zc_conn *)(unsigned long)user_data;
 }
 
-static inline size_t get_refill_ring_size(unsigned int rq_entries)
+static inline size_t get_refill_ring_size(unsigned int rq_entries,
+					    unsigned int notif_stats_size,
+					    unsigned int notif_stats_alignment)
 {
 	ring_size = rq_entries * sizeof(struct io_uring_zcrx_rqe);
 	/* add space for the header (head/tail/etc.) */
 	ring_size += page_size;
+
+	if (cfg_notif && notif_stats_size) {
+		notif_stats_offset = T_ALIGN_UP(ring_size,
+						notif_stats_alignment);
+		ring_size = notif_stats_offset + notif_stats_size;
+	}
+
 	return T_ALIGN_UP(ring_size, page_size);
 }
 
@@ -236,19 +250,26 @@ static void zcrx_populate_area(struct io_uring_zcrx_area_reg *area_reg)
 	area_reg->flags = 0;
 }
 
-static void setup_zcrx(struct io_uring *ring)
+static void setup_zcrx(struct io_uring *ring,
+		       unsigned int notif_stats_size,
+		       unsigned int notif_stats_alignment)
 {
 	struct io_uring_zcrx_area_reg area_reg;
+	struct zcrx_notification_desc notif;
 	unsigned int ifindex;
 	unsigned int rq_entries = cfg_rq_entries;
 	unsigned rq_flags = 0;
+	bool use_notif;
 	int ret;
+
+	use_notif = cfg_notif;
 
 	ifindex = if_nametoindex(cfg_ifname);
 	if (!ifindex)
 		t_error(1, 0, "bad interface name: %s", cfg_ifname);
 
-	ring_size = get_refill_ring_size(rq_entries);
+	ring_size = get_refill_ring_size(rq_entries, notif_stats_size,
+					notif_stats_alignment);
 	ring_ptr = NULL;
 	if (cfg_rq_alloc_mode == RQ_ALLOC_USER) {
 		ring_ptr = mmap(NULL, ring_size,
@@ -276,6 +297,18 @@ static void setup_zcrx(struct io_uring *ring)
 		.region_ptr = uring_ptr_to_u64(&region_reg),
 	};
 
+	if (use_notif) {
+		memset(&notif, 0, sizeof(notif));
+		notif.user_data = NOTIF_USER_DATA;
+		notif.type_mask = ZCRX_NOTIF_NO_BUFFERS |
+				  ZCRX_NOTIF_COPY;
+		if (notif_stats_size) {
+			notif.flags = ZCRX_NOTIF_DESC_FLAG_STATS;
+			notif.stats_offset = notif_stats_offset;
+		}
+		reg.notif_desc = uring_ptr_to_u64(&notif);
+	}
+
 	ret = io_uring_register_ifq(ring, &reg);
 	if (ret)
 		t_error(1, 0, "io_uring_register_ifq(): %d", ret);
@@ -297,6 +330,10 @@ static void setup_zcrx(struct io_uring *ring)
 
 	zcrx_id = reg.zcrx_id;
 	area_token = area_reg.rq_area_token;
+
+	if (use_notif && notif_stats_size)
+		notif_stats = (struct io_uring_zcrx_notif_stats *)
+				((char *)ring_ptr + notif_stats_offset);
 }
 
 static void add_accept(struct io_uring *ring, int sockfd)
@@ -473,6 +510,40 @@ static void process_recvzc(struct io_uring *ring,
 	return_buffer(&rq_ring, cqe);
 }
 
+static void rearm_notification(struct io_uring *ring, __u32 type_mask)
+{
+	struct zcrx_ctrl ctrl = {
+		.zcrx_id = zcrx_id,
+		.op = ZCRX_CTRL_ARM_NOTIFICATION,
+	};
+	int ret;
+
+	ctrl.zc_arm_notif.type_mask = type_mask;
+	ret = io_uring_register(ring->ring_fd, IORING_REGISTER_ZCRX_CTRL,
+				&ctrl, 0);
+	if (ret < 0)
+		fprintf(stderr, "arm notification failed: %d\n", ret);
+}
+
+static void process_notification(struct io_uring *ring,
+				 struct io_uring_cqe *cqe)
+{
+	__u32 type_mask = cqe->res;
+
+	if (type_mask & ZCRX_NOTIF_NO_BUFFERS)
+		printf("Notification: no buffers available\n");
+	if (type_mask & ZCRX_NOTIF_COPY) {
+		printf("Notification: copy fallback\n");
+
+		if (notif_stats)
+			printf("  stats: copy_count=%llu copy_bytes=%llu\n",
+				(unsigned long long)notif_stats->copy_count,
+				(unsigned long long)notif_stats->copy_bytes);
+	}
+
+	rearm_notification(ring, type_mask);
+}
+
 static void server_loop(struct io_uring *ring)
 {
 	struct io_uring_cqe *cqe;
@@ -484,6 +555,11 @@ static void server_loop(struct io_uring *ring)
 		t_error(1, ret, "io_uring_submit_and_wait failed\n");
 
 	io_uring_for_each_cqe(ring, head, cqe) {
+		if (cqe->user_data == NOTIF_USER_DATA) {
+			process_notification(ring, cqe);
+			count++;
+			continue;
+		}
 		switch (cqe->user_data & REQ_TYPE_MASK) {
 		case REQ_TYPE_ACCEPT:
 			process_accept(ring, cqe);
@@ -499,7 +575,8 @@ static void server_loop(struct io_uring *ring)
 	io_uring_cq_advance(ring, count);
 }
 
-static void run_server(void)
+static void run_server(unsigned int notif_stats_size,
+		       unsigned int notif_stats_alignment)
 {
 	struct io_uring_params p;
 	struct io_uring ring;
@@ -534,7 +611,7 @@ static void run_server(void)
 	if (ret)
 		t_error(1, ret, "ring init failed");
 
-	setup_zcrx(&ring);
+	setup_zcrx(&ring, notif_stats_size, notif_stats_alignment);
 	add_accept(&ring, listen_fd);
 
 	while (!stop)
@@ -556,7 +633,7 @@ static void parse_opts(int argc, char **argv)
 	if (argc <= 1)
 		usage(argv[0]);
 
-	while ((c = getopt(argc, argv, "vp:i:q:s:r:A:S:C:R:c:")) != -1) {
+	while ((c = getopt(argc, argv, "vNp:i:q:s:r:A:S:C:R:c:")) != -1) {
 		switch (c) {
 		case 'p':
 			cfg_port = strtoul(optarg, NULL, 0);
@@ -592,10 +669,14 @@ static void parse_opts(int argc, char **argv)
 		case 'R':
 			cfg_rq_entries = strtoul(optarg, NULL, 0);
 			break;
-		case 'c':
+	case 'c':
 			cfg_affinity_mode = strtoul(optarg, NULL, 0);
 			if (cfg_affinity_mode >= __AFFINITY_MODE_MAX)
 				t_error(1, 0, "Invalid affinity mode");
+			break;
+		case 'N':
+			cfg_notif = true;
+			break;
 		}
 	}
 
@@ -610,8 +691,47 @@ static void parse_opts(int argc, char **argv)
 	addr6->sin6_addr = in6addr_any;
 }
 
+static void probe_notification(unsigned int *stats_size,
+			       unsigned int *stats_alignment)
+{
+	struct io_uring_query_zcrx zcrx_query = {};
+	struct io_uring_query_hdr zcrx_hdr = {
+		.size = sizeof(zcrx_query),
+		.query_data = uring_ptr_to_u64(&zcrx_query),
+		.query_op = IO_URING_QUERY_ZCRX,
+	};
+	struct io_uring_query_zcrx_notif notif_query = {};
+	struct io_uring_query_hdr notif_hdr = {
+		.size = sizeof(notif_query),
+		.query_data = uring_ptr_to_u64(&notif_query),
+		.query_op = IO_URING_QUERY_ZCRX_NOTIF,
+	};
+	int ret;
+
+	*stats_size = 0;
+	*stats_alignment = 0;
+
+	ret = io_uring_register(-1, IORING_REGISTER_QUERY, &zcrx_hdr, 0);
+	if (ret < 0 || zcrx_hdr.result < 0)
+		return;
+	if (!(zcrx_query.features & ZCRX_FEATURE_NOTIFICATION)) {
+		printf("Warning: notifications not supported by kernel\n");
+		cfg_notif = false;
+		return;
+	}
+
+	ret = io_uring_register(-1, IORING_REGISTER_QUERY, &notif_hdr, 0);
+	if (ret < 0 || notif_hdr.result < 0)
+		return;
+
+	*stats_size = notif_query.notif_stats_size;
+	*stats_alignment = notif_query.notif_stats_off_alignment;
+}
+
 int main(int argc, char **argv)
 {
+	unsigned int stats_size = 0, stats_alignment = 0;
+
 	page_size = sysconf(_SC_PAGESIZE);
 	if (page_size < 0) {
 		perror("sysconf(_SC_PAGESIZE)");
@@ -619,6 +739,8 @@ int main(int argc, char **argv)
 	}
 
 	parse_opts(argc, argv);
-	run_server();
+	if (cfg_notif)
+		probe_notification(&stats_size, &stats_alignment);
+	run_server(stats_size, stats_alignment);
 	return 0;
 }
